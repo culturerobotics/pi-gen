@@ -309,6 +309,40 @@ if [[ -n "${WPA_PASSWORD}" && ${#WPA_PASSWORD} -lt 8 || ${#WPA_PASSWORD} -gt 63 
 	exit 1
 fi
 
+NETWORK_CONFIG="${BASE_DIR}/stage2/04-cloud-init/files/network-config"
+if [ "${ENABLE_CLOUD_INIT:-1}" = "1" ] && grep -q "WIFI_HASH_PLACEHOLDER" "${NETWORK_CONFIG}" 2>/dev/null; then
+	WIFI_SSID="${WIFI_SSID:-}"
+	WIFI_PASSWORD="${WIFI_PASSWORD:-}"
+
+	if [ -z "${WIFI_SSID}" ]; then
+		read -r -p "WiFi SSID: " WIFI_SSID
+	fi
+	if [ -z "${WIFI_PASSWORD}" ]; then
+		read -r -s -p "WiFi password: " WIFI_PASSWORD
+		echo
+	fi
+
+	if [ -z "${WIFI_SSID}" ] || [ -z "${WIFI_PASSWORD}" ]; then
+		echo "WIFI_SSID and WIFI_PASSWORD are required for network-config"
+		exit 1
+	fi
+
+	if [ ${#WIFI_PASSWORD} -lt 8 ] || [ ${#WIFI_PASSWORD} -gt 63 ]; then
+		echo "WiFi password must be between 8 and 63 characters"
+		exit 1
+	fi
+
+	if ! command -v wpa_passphrase &>/dev/null; then
+		echo "wpa_passphrase not found. Install wpasupplicant: apt install wpasupplicant"
+		exit 1
+	fi
+
+	WIFI_HASH=$(wpa_passphrase "${WIFI_SSID}" "${WIFI_PASSWORD}" | grep -v '#' | grep psk= | cut -d= -f2)
+	sed -i "s/WIFI_SSID_PLACEHOLDER/${WIFI_SSID}/g" "${NETWORK_CONFIG}"
+	sed -i "s/WIFI_HASH_PLACEHOLDER/${WIFI_HASH}/g" "${NETWORK_CONFIG}"
+	log "WiFi configured for SSID: ${WIFI_SSID}"
+fi
+
 if [[ "${PUBKEY_ONLY_SSH}" = "1" && -z "${PUBKEY_SSH_FIRST_USER}" ]]; then
 	echo "Must set 'PUBKEY_SSH_FIRST_USER' to a valid SSH public key if using PUBKEY_ONLY_SSH"
 	exit 1
