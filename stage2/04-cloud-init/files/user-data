@@ -1,102 +1,188 @@
 #cloud-config
+hostname: unprovisioned-pi
+manage_etc_hosts: true
 
-# This is the user-data configuration file for cloud-init. By default this sets
-# up an initial user called "ubuntu" with password "ubuntu", which must be
-# changed at first login. However, many additional actions can be initiated on
-# first boot from this file. The cloud-init documentation has more details:
-#
-# https://cloudinit.readthedocs.io/
-#
-# Please note that the YAML format employed by this file is sensitive to
-# differences in whitespace; if you are editing this file in an editor (like
-# Notepad) which uses literal tabs, take care to only use spaces for
-# indentation. See the following link for more details:
-#
-# https://en.wikipedia.org/wiki/YAML
-#
-# Some additional examples are provided in comments below the default
-# configuration.
+users:
+  - name: culture
+    groups: [adm, sudo, netdev, audio, video, plugdev, dialout, gpio, spi, i2c, render]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - gh:jmeed
+      - gh:k0s
 
-## Set the system's hostname. Please note that, unless you have a local DNS
-## setup where the hostname is derived from DHCP requests (as with dnsmasq),
-## setting the hostname here will not make the machine reachable by this name.
-## You may also wish to install avahi-daemon (see the "packages:" key below)
-## to make your machine reachable by the .local domain
-#hostname: raspberrypi
+packages:
+  - curl
 
-## Set up the keyboard layout. See localectl(1), in particular the various
-## list-x11-* sub-commands, to determine the available models, layouts,
-## variants, and options
-#keyboard:
-#  model: pc105
-#  layout: gb
-#  variant:
-#  options: ctrl:nocaps
+write_files:
+  - path: /usr/local/sbin/ssh_key_update.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
 
-# Controls password authentication with the SSH daemon; the default here can
-# prevent logging into SSH with a password. Changing this is a security risk
-# and you should at the very least ensure a different default password is
-# specified above
-#ssh_pwauth: false
+      # Script to update SSH keys from S3 location
+      # This script is run automatically at boot and on a timer
 
-## On first boot, use ssh-import-id to give the specific users SSH access to
-## the default user
-#ssh_import_id:
-#- lp:my_launchpad_username
-#- gh:my_github_username
+      LOG_FILE="/var/log/ssh_key_update.log"
+      SSH_KEY_URL="https://s3.us-west-2.amazonaws.com/developer.ssh.keys/culture.public.keys"
+      USER="culture"
 
-## Add users and groups to the system, and import keys with the ssh-import-id
-## utility
-#groups:
-#- robot: [robot]
-#- robotics: [robot]
-#- pi
-#
-#users:
-#- default
-#- name: robot
-#  gecos: Mr. Robot
-#  primary_group: robot
-#  groups: users
-#  ssh_import_id: foobar
-#  lock_passwd: false
-#  passwd: $5$hkui88$nvZgIle31cNpryjRfO9uArF7DYiBcWEnjqq7L1AQNN3
+      # Resolve home dir at runtime (no ansible vars)
+      USER_HOME="$(getent passwd "$USER" | cut -d: -f6)"
+      AUTHORIZED_KEYS_FILE="${USER_HOME}/.ssh/authorized_keys"
 
-## Update apt database and upgrade packages on first boot
-#package_update: true
-#package_upgrade: true
+      log_message() {
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+          logger -t ssh_key_update "$1" || true
+      }
 
-## Install additional packages on first boot
-#packages:
-#- avahi-daemon
-#- rng-tools
-#- python3-gpiozero
-#- [python3-serial, 3.5-1]
+      log_message "Starting SSH key update process"
 
-## Write arbitrary files to the file-system (including binaries!)
-#write_files:
-#- path: /etc/default/console-setup
-#  content: |
-#    # Consult the console-setup(5) manual page.
-#    ACTIVE_CONSOLES="/dev/tty[1-6]"
-#    CHARMAP="UTF-8"
-#    VIDEOMODE=
-#    FONT="Lat15-Terminus18x10.psf.gz"
-#    FONTFACE=
-#    FONTSIZE=
-#    CODESET="Lat15"
-#  permissions: '0644'
-#  owner: root:root
-#- encoding: gzip
-#  path: /root/Makefile
-#  content: !!binary |
-#    H4sICF2DTWIAA01ha2VmaWxlAFNWCM8syVBILMjPyU/PTC1WKMlXiPB2dlFQNjSx5MpNteLi
-#    dLDiSoRQxYl5KeWZyRkgXrSCkoqKRmaKgm6pppKCbmqhgoFCrIKamkK1QmpyRr6Ckn92YqWS
-#    NdC80uQMBZhOa4VahZoaqIrwjMQSewXfxOxUhcwShcr80qLi1Jw0RSUuAIYfEJmVAAAA
-#  owner: root:root
-#  permissions: '0644'
+      # Create .ssh directory if it doesn't exist
+      mkdir -p "${USER_HOME}/.ssh"
+      chmod 700 "${USER_HOME}/.ssh"
+      chown "${USER}:${USER}" "${USER_HOME}/.ssh"
 
-## Run arbitrary commands at rc.local like time
-#runcmd:
-#- [ ls, -l, / ]
-#- [ sh, -xc, "echo $(date) ': hello world!'" ]
+      # Download keys from S3
+      log_message "Downloading SSH keys from $SSH_KEY_URL"
+      if curl -fsSL -o /tmp/ssh_keys.tmp "$SSH_KEY_URL"; then
+          log_message "Successfully downloaded SSH keys"
+
+          # Backup existing authorized_keys
+          if [ -f "$AUTHORIZED_KEYS_FILE" ]; then
+              cp "$AUTHORIZED_KEYS_FILE" "${AUTHORIZED_KEYS_FILE}.backup.$(date +%Y%m%d-%H%M%S)"
+              log_message "Backed up existing authorized_keys file"
+          fi
+
+          # Optional: basic sanity filter (prevents HTML/garbage from nuking access)
+          TMP2="$(mktemp)"
+          grep -E '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) ' /tmp/ssh_keys.tmp > "$TMP2" || true
+          mv "$TMP2" /tmp/ssh_keys.tmp
+
+          # Update authorized_keys atomically
+          mv /tmp/ssh_keys.tmp "$AUTHORIZED_KEYS_FILE"
+          chmod 600 "$AUTHORIZED_KEYS_FILE"
+          chown "${USER}:${USER}" "$AUTHORIZED_KEYS_FILE"
+
+          log_message "SSH keys updated successfully"
+      else
+          log_message "Failed to download SSH keys from $SSH_KEY_URL"
+          exit 1
+      fi
+
+      log_message "SSH key update process completed"
+
+  - path: /usr/local/sbin/set-random-hostname.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      # Generate a random hostname on first boot
+      RAND=$(head -c 3 /dev/urandom | xxd -p)
+      NEW_HOSTNAME="pi-${RAND}"
+      hostnamectl set-hostname "${NEW_HOSTNAME}"
+      sed -i "s/127.0.1.1.*/127.0.1.1\t${NEW_HOSTNAME}/" /etc/hosts
+      logger -t set-random-hostname "Hostname set to ${NEW_HOSTNAME}"
+
+  - path: /usr/local/sbin/display-ip-info.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      # Display hostname and IP address on the console
+
+      HOSTNAME=$(hostname)
+      # Wait up to 30s for a non-loopback IP
+      for i in $(seq 1 30); do
+          IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+          [ -n "$IP" ] && break
+          sleep 1
+      done
+      IP=${IP:-"(no IP yet)"}
+
+      MSG="\n============================================"
+      MSG+="\n  Hostname : ${HOSTNAME}"
+      MSG+="\n  IP       : ${IP}"
+      MSG+="\n============================================\n"
+
+      # Print to all consoles
+      echo -e "$MSG" > /dev/console 2>/dev/null || true
+      echo -e "$MSG" | wall 2>/dev/null || true
+
+      # Update /etc/issue so it shows on the login prompt too
+      cat > /etc/issue <<ISSUE
+      Raspberry Pi — \n
+      IP: \4
+      ISSUE
+
+      logger -t display-ip-info "Hostname: ${HOSTNAME}, IP: ${IP}"
+
+  - path: /etc/systemd/system/set-random-hostname.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Set a random hostname on first boot
+      ConditionPathExists=!/var/lib/random-hostname-set
+      Before=network-pre.target
+      Wants=network-pre.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/set-random-hostname.sh
+      ExecStartPost=/usr/bin/touch /var/lib/random-hostname-set
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/display-ip-info.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Display hostname and IP on console at boot
+      Wants=network-online.target
+      After=network-online.target set-random-hostname.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/display-ip-info.sh
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/ssh-key-update.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Update SSH authorized_keys for culture from S3 URL
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/ssh_key_update.sh
+      Nice=10
+
+  - path: /etc/systemd/system/ssh-key-update.timer
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Run ssh-key-update at boot and every 30 minutes
+
+      [Timer]
+      OnBootSec=2min
+      OnUnitActiveSec=30min
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
+runcmd:
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, set-random-hostname.service]
+  - [systemctl, enable, --now, display-ip-info.service]
+  - [systemctl, enable, --now, ssh-key-update.timer]
+  # Run once immediately on first boot too:
+  - [systemctl, start, ssh-key-update.service]
+  - [reboot]
