@@ -35,4 +35,4 @@ wifis:
     optional: false
     access-points:
       WIFI_SSID_PLACEHOLDER:
-        password: hash:WIFI_HASH_PLACEHOLDER
+        password: WIFI_HASH_PLACEHOLDER

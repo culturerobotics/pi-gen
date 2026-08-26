@@ -73,37 +73,87 @@ write_files:
 
       log_message "SSH key update process completed"
 
-  - path: /usr/local/sbin/set-random-hostname.sh
-    permissions: "0755"
-    content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
-      # Generate a random hostname on first boot
-      RAND=$(head -c 3 /dev/urandom | xxd -p)
-      NEW_HOSTNAME="pi-${RAND}"
-      hostnamectl set-hostname "${NEW_HOSTNAME}"
-      sed -i "s/127.0.1.1.*/127.0.1.1\t${NEW_HOSTNAME}/" /etc/hosts
-      logger -t set-random-hostname "Hostname set to ${NEW_HOSTNAME}"
-
   - path: /usr/local/sbin/display-ip-info.sh
     permissions: "0755"
     content: |
       #!/usr/bin/env bash
       set -euo pipefail
-      # Display hostname and IP address on the console
+      # Display hostname and every physical interface's IP on the console
 
       HOSTNAME=$(hostname)
-      # Wait up to 30s for a non-loopback IP
-      for i in $(seq 1 30); do
-          IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-          [ -n "$IP" ] && break
+
+      # Physical NICs have a device symlink to their backing bus device; lo,
+      # docker0, veth* and br-* do not. Falls back to everything-but-lo so the
+      # banner can never come out empty.
+      list_interfaces() {
+          local dev name found=""
+          for dev in /sys/class/net/*; do
+              if [ ! -e "$dev" ]; then continue; fi
+              name=${dev##*/}
+              if [ -e "$dev/device" ]; then found="${found}${name} "; fi
+          done
+          if [ -z "$found" ]; then
+              for dev in /sys/class/net/*; do
+                  if [ ! -e "$dev" ]; then continue; fi
+                  name=${dev##*/}
+                  if [ "$name" != "lo" ]; then found="${found}${name} "; fi
+              done
+          fi
+          printf '%s' "$found"
+      }
+
+      # Global scope only, which drops IPv6 link-local (fe80::) and IPv4 169.254.*
+      addrs_for() {
+          local name="$1" addr out=""
+          for addr in $( { ip -o -4 addr show dev "$name" scope global; \
+                           ip -o -6 addr show dev "$name" scope global; } 2>/dev/null \
+                         | awk '{print $4}' || true ); do
+              if [ -n "$out" ]; then out="${out}, ${addr}"; else out="$addr"; fi
+          done
+          printf '%s' "$out"
+      }
+
+      # Default gateway for this interface, if it owns a default route
+      gw_for() {
+          local name="$1" gw out=""
+          for gw in $( { ip -4 route show default dev "$name"; \
+                         ip -6 route show default dev "$name"; } 2>/dev/null \
+                       | awk '$2=="via"{print $3}' || true ); do
+              if [ -n "$out" ]; then out="${out}, ${gw}"; else out="$gw"; fi
+          done
+          printf '%s' "$out"
+      }
+
+      has_any_address() {
+          local name
+          for name in $(list_interfaces); do
+              if [ -n "$(addrs_for "$name")" ]; then return 0; fi
+          done
+          return 1
+      }
+
+      # Wait up to 30s for the first address, then let slower interfaces settle
+      for _ in $(seq 1 30); do
+          if has_any_address; then break; fi
           sleep 1
       done
-      IP=${IP:-"(no IP yet)"}
+      sleep 3
 
       MSG="\n============================================"
       MSG+="\n  Hostname : ${HOSTNAME}"
-      MSG+="\n  IP       : ${IP}"
+      SUMMARY=""
+      for IFACE in $(list_interfaces); do
+          ADDR=$(addrs_for "$IFACE")
+          STATE=$(cat "/sys/class/net/${IFACE}/operstate" 2>/dev/null || echo unknown)
+          GW=$(gw_for "$IFACE")
+          if [ -z "$ADDR" ]; then ADDR="no IP"; fi
+          DETAIL="$STATE"
+          if [ -n "$GW" ]; then DETAIL="${DETAIL}, gw ${GW}"; fi
+          MSG+="\n$(printf '  %-8s : %s (%s)' "$IFACE" "$ADDR" "$DETAIL")"
+          if [ -n "$SUMMARY" ]; then SUMMARY="${SUMMARY}; "; fi
+          SUMMARY="${SUMMARY}${IFACE}=${ADDR}"
+          if [ -n "$GW" ]; then SUMMARY="${SUMMARY} gw ${GW}"; fi
+      done
       MSG+="\n============================================\n"
 
       # Print to all consoles
@@ -116,25 +166,7 @@ write_files:
       IP: \4
       ISSUE
 
-      logger -t display-ip-info "Hostname: ${HOSTNAME}, IP: ${IP}"
-
-  - path: /etc/systemd/system/set-random-hostname.service
-    permissions: "0644"
-    content: |
-      [Unit]
-      Description=Set a random hostname on first boot
-      ConditionPathExists=!/var/lib/random-hostname-set
-      Before=network-pre.target
-      Wants=network-pre.target
-
-      [Service]
-      Type=oneshot
-      ExecStart=/usr/local/sbin/set-random-hostname.sh
-      ExecStartPost=/usr/bin/touch /var/lib/random-hostname-set
-      RemainAfterExit=yes
-
-      [Install]
-      WantedBy=multi-user.target
+      logger -t display-ip-info "Hostname: ${HOSTNAME}, ${SUMMARY:-no interfaces}"
 
   - path: /etc/systemd/system/display-ip-info.service
     permissions: "0644"
@@ -142,7 +174,7 @@ write_files:
       [Unit]
       Description=Display hostname and IP on console at boot
       Wants=network-online.target
-      After=network-online.target set-random-hostname.service
+      After=network-online.target
 
       [Service]
       Type=oneshot
@@ -180,7 +212,6 @@ write_files:
 
 runcmd:
   - [systemctl, daemon-reload]
-  - [systemctl, enable, --now, set-random-hostname.service]
   - [systemctl, enable, --now, display-ip-info.service]
   - [systemctl, enable, --now, ssh-key-update.timer]
   # Run once immediately on first boot too:

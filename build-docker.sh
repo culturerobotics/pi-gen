@@ -130,6 +130,14 @@ if [[ "${binfmt_misc_required}" == "1" ]]; then
   fi
 fi
 
+# Forward any WIFI_* variables into the container. "-e NAME" without a value
+# passes it through from this environment, so passwords never appear in the
+# container's process arguments.
+WIFI_ENV=""
+for wifi_var in $(env | sed -n 's/^\(WIFI_[A-Z0-9_]*\)=.*/\1/p'); do
+	WIFI_ENV="${WIFI_ENV} -e ${wifi_var}"
+done
+
 trap 'echo "got CTRL+C... please wait 5s" && ${DOCKER} stop -t 5 ${DOCKER_CMDLINE_NAME}' SIGINT SIGTERM
 time ${DOCKER} run \
   $DOCKER_CMDLINE_PRE \
@@ -138,6 +146,7 @@ time ${DOCKER} run \
   ${PIGEN_DOCKER_OPTS} \
   --volume "${CONFIG_FILE}":/config:ro \
   -e "GIT_HASH=${GIT_HASH}" \
+  ${WIFI_ENV} \
   $DOCKER_CMDLINE_POST \
   pi-gen \
   bash -e -o pipefail -c "
