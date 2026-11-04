@@ -310,37 +310,95 @@ if [[ -n "${WPA_PASSWORD}" && ${#WPA_PASSWORD} -lt 8 || ${#WPA_PASSWORD} -gt 63 
 fi
 
 NETWORK_CONFIG="${BASE_DIR}/stage2/04-cloud-init/files/network-config"
-if [ "${ENABLE_CLOUD_INIT:-1}" = "1" ] && grep -q "WIFI_HASH_PLACEHOLDER" "${NETWORK_CONFIG}" 2>/dev/null; then
-	WIFI_SSID="${WIFI_SSID:-}"
-	WIFI_PASSWORD="${WIFI_PASSWORD:-}"
+if [ "${ENABLE_CLOUD_INIT:-1}" = "1" ] && grep -q "WIFI_SSID_PLACEHOLDER" "${NETWORK_CONFIG}" 2>/dev/null; then
+	WIFI_AP_BLOCK=""
 
-	if [ -z "${WIFI_SSID}" ]; then
-		read -r -p "WiFi SSID: " WIFI_SSID
-	fi
-	if [ -z "${WIFI_PASSWORD}" ]; then
-		read -r -s -p "WiFi password: " WIFI_PASSWORD
-		echo
+	# Append one access point to the generated block, hashing the passphrase
+	# unless a pre-computed PSK was supplied.
+	add_wifi_ap() {
+		local ssid="$1" password="$2" psk="$3"
+		if [ -z "${psk}" ]; then
+			if ! command -v wpa_passphrase &>/dev/null; then
+				echo "wpa_passphrase not found. Install wpasupplicant, or pass an"
+				echo "already-hashed PSK via WIFI_PSK instead of WIFI_PASSWORD."
+				exit 1
+			fi
+			if [ ${#password} -lt 8 ] || [ ${#password} -gt 63 ]; then
+				echo "WiFi password for '${ssid}' must be between 8 and 63 characters"
+				exit 1
+			fi
+			psk=$(wpa_passphrase "${ssid}" "${password}" | grep -v '#' | grep psk= | cut -d= -f2)
+		fi
+		WIFI_AP_BLOCK="${WIFI_AP_BLOCK}      ${ssid}:
+        password: ${psk}
+"
+		log "WiFi configured for SSID: ${ssid}"
+	}
+
+	# WIFI_SSID/WIFI_PASSWORD is the first network; WIFI_SSID_2, WIFI_SSID_3 ...
+	# add more. WIFI_PSK[_n] supplies a pre-hashed PSK instead of a passphrase.
+	wifi_n=1
+	while true; do
+		if [ "${wifi_n}" = "1" ]; then wifi_sfx=""; else wifi_sfx="_${wifi_n}"; fi
+		eval "wifi_ssid=\${WIFI_SSID${wifi_sfx}:-}"
+		eval "wifi_pass=\${WIFI_PASSWORD${wifi_sfx}:-}"
+		eval "wifi_psk=\${WIFI_PSK${wifi_sfx}:-}"
+		if [ -z "${wifi_ssid}" ]; then break; fi
+		if [ -z "${wifi_pass}" ] && [ -z "${wifi_psk}" ]; then
+			echo "WIFI_SSID${wifi_sfx} is set but neither WIFI_PASSWORD${wifi_sfx} nor WIFI_PSK${wifi_sfx} is"
+			exit 1
+		fi
+		add_wifi_ap "${wifi_ssid}" "${wifi_pass}" "${wifi_psk}"
+		wifi_n=$((wifi_n + 1))
+	done
+
+	# Nothing in the environment: prompt, if there is a terminal to prompt on.
+	# ./build-docker.sh runs the container without a tty, so it must use the
+	# environment variables above (it forwards any WIFI_* it can see).
+	if [ -z "${WIFI_AP_BLOCK}" ]; then
+		if [ ! -t 0 ]; then
+			echo "No WiFi networks configured, and no terminal available to prompt on."
+			echo "Set WIFI_SSID and WIFI_PASSWORD before building; add WIFI_SSID_2 /"
+			echo "WIFI_PASSWORD_2 (and _3, _4 ...) for additional access points, or use"
+			echo "WIFI_PSK[_n] to supply an already-hashed PSK."
+			exit 1
+		fi
+		while true; do
+			read -r -p "WiFi SSID: " wifi_ssid
+			if [ -z "${wifi_ssid}" ]; then
+				echo "SSID cannot be empty"
+				continue
+			fi
+			read -r -s -p "WiFi password: " wifi_pass
+			echo
+			add_wifi_ap "${wifi_ssid}" "${wifi_pass}" ""
+			read -r -p "Add another WiFi network? [y/N] " wifi_more
+			case "${wifi_more}" in
+				[Yy]*) ;;
+				*) break ;;
+			esac
+		done
 	fi
 
-	if [ -z "${WIFI_SSID}" ] || [ -z "${WIFI_PASSWORD}" ]; then
-		echo "WIFI_SSID and WIFI_PASSWORD are required for network-config"
-		exit 1
-	fi
-
-	if [ ${#WIFI_PASSWORD} -lt 8 ] || [ ${#WIFI_PASSWORD} -gt 63 ]; then
-		echo "WiFi password must be between 8 and 63 characters"
-		exit 1
-	fi
-
-	if ! command -v wpa_passphrase &>/dev/null; then
-		echo "wpa_passphrase not found. Install wpasupplicant: apt install wpasupplicant"
-		exit 1
-	fi
-
-	WIFI_HASH=$(wpa_passphrase "${WIFI_SSID}" "${WIFI_PASSWORD}" | grep -v '#' | grep psk= | cut -d= -f2)
-	sed -i "s/WIFI_SSID_PLACEHOLDER/${WIFI_SSID}/g" "${NETWORK_CONFIG}"
-	sed -i "s/WIFI_HASH_PLACEHOLDER/${WIFI_HASH}/g" "${NETWORK_CONFIG}"
-	log "WiFi configured for SSID: ${WIFI_SSID}"
+	# Swap the placeholder access point for the generated block. The block goes
+	# via a file because awk -v cannot carry embedded newlines portably; keep it
+	# out of the work tree since it briefly holds the PSKs.
+	WIFI_BLOCK_FILE=$(mktemp)
+	trap 'rm -f "${WIFI_BLOCK_FILE}"' EXIT
+	printf '%s' "${WIFI_AP_BLOCK}" > "${WIFI_BLOCK_FILE}"
+	awk -v blockfile="${WIFI_BLOCK_FILE}" '
+		/^      WIFI_SSID_PLACEHOLDER:$/ {
+			while ((getline line < blockfile) > 0) print line
+			close(blockfile)
+			skip = 1
+			next
+		}
+		skip > 0 { skip--; next }
+		{ print }
+	' "${NETWORK_CONFIG}" > "${NETWORK_CONFIG}.tmp"
+	mv "${NETWORK_CONFIG}.tmp" "${NETWORK_CONFIG}"
+	rm -f "${WIFI_BLOCK_FILE}"
+	trap - EXIT
 fi
 
 if [[ "${PUBKEY_ONLY_SSH}" = "1" && -z "${PUBKEY_SSH_FIRST_USER}" ]]; then
